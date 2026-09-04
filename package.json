@@ -1,0 +1,43 @@
+{
+  "name": "pi-request-meter",
+  "version": "0.1.0",
+  "description": "Detect abnormal Pi token consumption without extra model calls. / 零额外模型调用地检测 Pi Token 消耗异常。",
+  "author": "Koma-Chen",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Koma-Chen/pi-request-meter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Koma-Chen/pi-request-meter/issues"
+  },
+  "homepage": "https://github.com/Koma-Chen/pi-request-meter#readme",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "token",
+    "usage",
+    "monitoring",
+    "anomaly-detection"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check index.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
