@@ -5,15 +5,28 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 const STATUS_ID = "request-meter";
 const MAX_SAMPLES = 100;
 const MAX_ANOMALIES = 20;
-const MAX_FINGERPRINT_CHARS = 256_000;
 const MAX_FINGERPRINT_NODES = 20_000;
 const MAX_FINGERPRINT_DEPTH = 32;
-const LARGE_TOOL_TOKENS = 8_000;
+const MAX_FINGERPRINT_HASH_CHARS = 1_000_000;
+const MAX_FINGERPRINT_WORK_CHARS = 2_000_000;
+const FINGERPRINT_SAMPLE_CHARS = 1_024;
+const BASH_BLOOM_BYTES = 8_192;
+const MAX_NEW_BASH_PER_CONTEXT = 100;
+const MAX_BASH_FINGERPRINTS_PER_CONTEXT = 100;
+const MAX_CONTEXT_MESSAGES_SCANNED = 1_000;
+const LARGE_CONTRIBUTOR_TOKENS = 8_000;
+const LARGE_CONTRIBUTOR_ALERT_TOKENS = 20_000;
 const PROMPT_JUMP_TOKENS = 20_000;
+const SINGLE_PROMPT_TOKENS = 80_000;
+const SINGLE_PROMPT_CONTEXT_SHARE = 0.4;
+const CONTEXT_NEAR_LIMIT_PERCENT = 85;
 const OUTPUT_RUNAWAY_TOKENS = 8_000;
 const REASONING_RUNAWAY_TOKENS = 8_000;
 const REQUEST_STORM_COUNT = 12;
 const REQUEST_STORM_PROMPT_TOKENS = 500_000;
+const OPERATION_TOTAL_TOKENS = 750_000;
+const NESTED_TOTAL_TOKENS = 100_000;
+const STREAM_STATUS_INTERVAL_MS = 300;
 const MAX_DETAIL_CHARS = 1_000;
 const ALERTS_STATE_KEY = Symbol.for("pi-request-meter.alerts-state");
 
@@ -26,6 +39,7 @@ interface MeterUsage {
 	cacheWrite: number;
 	cacheWrite1h: number;
 	reasoning: number;
+	reasoningReports: number;
 	totalTokens: number;
 	cost: number;
 	reports: number;
@@ -39,6 +53,7 @@ interface UsageSample extends MeterUsage {
 	thinkingLevel: string;
 	boundary: number;
 	contextPercent?: number;
+	requestIndex: number;
 }
 
 interface Anomaly {
@@ -55,6 +70,20 @@ interface ToolPeak {
 	images: number;
 }
 
+interface PayloadFingerprint {
+	hash: string;
+	sampled: boolean;
+	comparable: boolean;
+}
+
+interface AssistantMetadata {
+	provider?: string;
+	model?: string;
+	responseModel?: string;
+	providerThinkingLevel?: string;
+	stopReason?: string;
+}
+
 interface OperationState {
 	startedAt: number;
 	endedAt?: number;
@@ -62,16 +91,32 @@ interface OperationState {
 	providerRequests: number;
 	providerResponses: number;
 	observedHttpFailures: number;
+	consecutiveHttpFailures: number;
 	consecutiveAssistantErrors: number;
 	highReasoningStreak: number;
 	lastPayloadFingerprint?: string;
+	lastPayloadSampled: boolean;
 	repeatedPayloads: number;
 	compactions: number;
+	compactionAttempts: number;
+	unknownAuxiliaryUsage: number;
+	missingCompactionUsage: number;
+	missingTreeUsage: number;
+	cancelledCompactions: number;
+	validUsageReports: number;
+	zeroUsageReports: number;
+	missingUsageReports: number;
+	streamTextBytes: number;
+	streamReasoningBytes: number;
+	lastStreamStatusAt: number;
 	mainUsage: MeterUsage;
 	auxiliaryUsage: MeterUsage;
 	nestedUsage: MeterUsage;
 	estimatedToolTokens: number;
-	largestTool?: ToolPeak;
+	estimatedUserBashTokens: number;
+	largeContributors: number;
+	peakPromptTokens: number;
+	largestContributor?: ToolPeak;
 	samples: UsageSample[];
 	anomalies: Anomaly[];
 	seenAnomalies: Set<string>;
@@ -119,6 +164,7 @@ function emptyUsage(): MeterUsage {
 		cacheWrite: 0,
 		cacheWrite1h: 0,
 		reasoning: 0,
+		reasoningReports: 0,
 		totalTokens: 0,
 		cost: 0,
 		reports: 0,
@@ -140,6 +186,7 @@ function normalizeUsage(value: unknown): MeterUsage | undefined {
 	const calculatedTotal = input + output + cacheRead + cacheWrite;
 	const reportedTotal = nonNegativeNumber(value.totalTokens);
 	const cost = isRecord(value.cost) ? nonNegativeNumber(value.cost.total) : 0;
+	const reasoningReported = typeof value.reasoning === "number" && Number.isFinite(value.reasoning) && value.reasoning >= 0;
 
 	return {
 		input,
@@ -148,6 +195,7 @@ function normalizeUsage(value: unknown): MeterUsage | undefined {
 		cacheWrite,
 		cacheWrite1h: nonNegativeNumber(value.cacheWrite1h),
 		reasoning: nonNegativeNumber(value.reasoning),
+		reasoningReports: reasoningReported ? 1 : 0,
 		totalTokens: reportedTotal || calculatedTotal,
 		cost,
 		reports: 1,
@@ -162,9 +210,15 @@ function addUsage(target: MeterUsage, usage: MeterUsage): void {
 	target.cacheWrite += usage.cacheWrite;
 	target.cacheWrite1h += usage.cacheWrite1h;
 	target.reasoning += usage.reasoning;
+	target.reasoningReports += usage.reasoningReports;
 	target.totalTokens += usage.totalTokens;
 	target.cost += usage.cost;
 	target.reports += usage.reports;
+}
+
+/** 判断 usage 是否包含可计费的非零 Token，零值失败样本不参与相对比较。 */
+function hasMeaningfulUsage(usage: MeterUsage): boolean {
+	return usage.input + usage.output + usage.cacheRead + usage.cacheWrite > 0;
 }
 
 /** 计算一次请求的全部提示 Token，缓存读写与普通输入互斥计入。 */
@@ -209,96 +263,200 @@ function estimateToolContent(content: unknown): { tokens: number; images: number
 }
 
 /**
- * 对最终 provider payload 做有上限的一次性摘要，只保留哈希以识别连续重复请求。
- * 超过字符、节点或深度上限时放弃本次比较，避免监控本身复制超大上下文。
+ * 对 provider payload 生成有界内存指纹：前 100 万字符完整哈希，超出后按字符串分段采样。
+ * 节点或深度过大时保留已遍历结构的降级指纹，不再让最值得关注的大请求完全失去重复检测。
  */
-function fingerprintPayload(payload: unknown): string | undefined {
+function fingerprintPayload(payload: unknown): PayloadFingerprint | undefined {
 	const hash = createHash("sha256");
 	const seen = new WeakSet<object>();
-	let chars = 0;
+	let hashedChars = 0;
+	let workChars = 0;
 	let nodes = 0;
-	let complete = true;
+	let sampled = false;
+	let comparable = true;
 
-	/** 按稳定键顺序流式写入哈希，不构造 payload 的 JSON 副本。 */
-	function visit(value: unknown, depth: number): void {
-		if (!complete) return;
-		nodes++;
-		if (nodes > MAX_FINGERPRINT_NODES || depth > MAX_FINGERPRINT_DEPTH) {
-			complete = false;
+	/** 所有哈希文本统一经过全局工作预算，避免大量键或采样片段绕过上限。 */
+	function updateText(value: string): boolean {
+		if (workChars + value.length > MAX_FINGERPRINT_WORK_CHARS) {
+			comparable = false;
+			return false;
+		}
+		hash.update(value);
+		workChars += value.length;
+		return true;
+	}
+
+	/** 二进制内容按字节计入同一工作预算，不复制底层 ArrayBuffer。 */
+	function updateBytes(value: Uint8Array): boolean {
+		if (workChars + value.byteLength > MAX_FINGERPRINT_WORK_CHARS) {
+			comparable = false;
+			return false;
+		}
+		hash.update(value);
+		workChars += value.byteLength;
+		return true;
+	}
+
+	/** 对超出完整哈希预算的字符串记录长度及头、中、尾样本，避免复制整份文本。 */
+	function hashString(value: string): void {
+		if (!updateText(`s${value.length}:`)) return;
+		if (
+			hashedChars + value.length <= MAX_FINGERPRINT_HASH_CHARS &&
+			workChars + value.length <= MAX_FINGERPRINT_WORK_CHARS
+		) {
+			updateText(value);
+			hashedChars += value.length;
 			return;
 		}
+		sampled = true;
+		const size = Math.min(FINGERPRINT_SAMPLE_CHARS, value.length);
+		const middle = Math.max(0, Math.floor((value.length - size) / 2));
+		updateText(value.slice(0, size));
+		updateText(value.slice(middle, middle + size));
+		updateText(value.slice(-size));
+	}
+
+	/** 为 typed array 记录类型、长度和有界内容样本，避免不同图片被统一视为空实例。 */
+	function hashBinary(type: string, value: Uint8Array): void {
+		if (!updateText(`binary:${type}:${value.byteLength}:`)) return;
+		if (hashedChars + value.byteLength <= MAX_FINGERPRINT_HASH_CHARS && workChars + value.byteLength <= MAX_FINGERPRINT_WORK_CHARS) {
+			updateBytes(value);
+			hashedChars += value.byteLength;
+			return;
+		}
+		sampled = true;
+		const size = Math.min(FINGERPRINT_SAMPLE_CHARS, value.byteLength);
+		const middle = Math.max(0, Math.floor((value.byteLength - size) / 2));
+		updateBytes(value.subarray(0, size));
+		updateBytes(value.subarray(middle, middle + size));
+		updateBytes(value.subarray(value.byteLength - size));
+	}
+
+	/** 按稳定键顺序流式写入哈希，不构造 payload 的完整 JSON 副本。 */
+	function visit(value: unknown, depth: number): void {
+		if (depth > MAX_FINGERPRINT_DEPTH || nodes >= MAX_FINGERPRINT_NODES) {
+			sampled = true;
+			comparable = false;
+			updateText(`limit:${depth}:${typeof value};`);
+			return;
+		}
+		nodes++;
 		if (value === null) {
-			hash.update("null;");
+			updateText("null;");
 			return;
 		}
 		if (typeof value === "string") {
-			chars += value.length;
-			if (chars > MAX_FINGERPRINT_CHARS) {
-				complete = false;
-				return;
-			}
-			hash.update(`s${value.length}:`);
-			hash.update(value);
+			hashString(value);
 			return;
 		}
-		if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
-			hash.update(`${typeof value}:${String(value)};`);
+		if (typeof value === "bigint") {
+			comparable = false;
+			updateText("bigint;");
+			return;
+		}
+		if (typeof value === "number" || typeof value === "boolean") {
+			updateText(`${typeof value}:${String(value)};`);
 			return;
 		}
 		if (typeof value === "undefined") {
-			hash.update("undefined;");
+			updateText("undefined;");
 			return;
 		}
-		if (typeof value !== "object") {
-			hash.update(`${typeof value};`);
+		if (typeof value === "function" || typeof value === "symbol") {
+			comparable = false;
+			updateText(`${typeof value};`);
 			return;
 		}
+		if (typeof value !== "object") return;
 		if (seen.has(value)) {
-			hash.update("circular;");
+			comparable = false;
+			updateText("circular;");
 			return;
 		}
 		seen.add(value);
+		if (ArrayBuffer.isView(value)) {
+			const view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+			hashBinary(value.constructor?.name ?? "TypedArray", view);
+			return;
+		}
+		if (value instanceof ArrayBuffer) {
+			hashBinary("ArrayBuffer", new Uint8Array(value));
+			return;
+		}
 		if (Array.isArray(value)) {
-			hash.update(`array:${value.length}[`);
-			for (const item of value) visit(item, depth + 1);
-			hash.update("]");
+			updateText(`array:${value.length}[`);
+			for (let index = 0; index < value.length; index++) {
+				if (nodes >= MAX_FINGERPRINT_NODES) {
+					sampled = true;
+					comparable = false;
+					updateText(`remaining:${value.length - index};`);
+					break;
+				}
+				visit(value[index], depth + 1);
+			}
+			updateText("]");
 			return;
 		}
 		if (!isPlainRecord(value)) {
-			complete = false;
+			sampled = true;
+			comparable = false;
+			updateText(`instance:${value.constructor?.name ?? "unknown"};`);
 			return;
 		}
+
 		const record = value;
-		let keyCount = 0;
+		const keys: string[] = [];
+		let pendingKeyChars = 0;
 		for (const key in record) {
 			if (!Object.hasOwn(record, key)) continue;
-			keyCount++;
-			if (nodes + keyCount > MAX_FINGERPRINT_NODES) {
-				complete = false;
-				return;
+			if (
+				nodes + keys.length >= MAX_FINGERPRINT_NODES ||
+				workChars + pendingKeyChars + key.length > MAX_FINGERPRINT_WORK_CHARS
+			) {
+				sampled = true;
+				comparable = false;
+				break;
 			}
+			keys.push(key);
+			pendingKeyChars += key.length;
 		}
-		const keys = Object.keys(record);
 		keys.sort();
-		hash.update(`object:${keys.length}{`);
+		updateText(`object:${keys.length}${comparable ? "" : "+"}{`);
 		for (const key of keys) {
-			chars += key.length;
-			if (chars > MAX_FINGERPRINT_CHARS) {
-				complete = false;
-				return;
-			}
-			hash.update(`k${key.length}:${key}`);
+			updateText(`key:`);
+			hashString(key);
 			visit(record[key], depth + 1);
 		}
-		hash.update("}");
+		updateText("}");
 	}
 
 	try {
 		visit(payload, 0);
-		return complete ? hash.digest("hex") : undefined;
+		return { hash: hash.digest("hex"), sampled, comparable };
 	} catch {
 		return undefined;
 	}
+}
+
+/** 仅哈希 user bash 的固定大小文本样本，避免单条巨大输出放大每轮去重成本。 */
+function fingerprintBashExecution(message: Record<string, unknown>): string {
+	const hash = createHash("sha256");
+	for (const key of ["command", "output"] as const) {
+		const value = typeof message[key] === "string" ? message[key] : "";
+		hash.update(`${key}:${value.length}:`);
+		if (value.length <= FINGERPRINT_SAMPLE_CHARS * 3) {
+			hash.update(value);
+		} else {
+			const middle = Math.floor((value.length - FINGERPRINT_SAMPLE_CHARS) / 2);
+			hash.update(value.slice(0, FINGERPRINT_SAMPLE_CHARS));
+			hash.update(value.slice(middle, middle + FINGERPRINT_SAMPLE_CHARS));
+			hash.update(value.slice(-FINGERPRINT_SAMPLE_CHARS));
+		}
+	}
+	hash.update(
+		`:${typeof message.timestamp === "number" ? message.timestamp : ""}:${String(message.exitCode ?? "")}:${String(message.cancelled ?? "")}:${String(message.truncated ?? "")}`,
+	);
+	return hash.digest("hex");
 }
 
 /** 创建一次从首次 agent_start 到 agent_settled 的完整任务窗口。 */
@@ -309,33 +467,55 @@ function createOperation(): OperationState {
 		providerRequests: 0,
 		providerResponses: 0,
 		observedHttpFailures: 0,
+		consecutiveHttpFailures: 0,
 		consecutiveAssistantErrors: 0,
 		highReasoningStreak: 0,
+		lastPayloadSampled: false,
 		repeatedPayloads: 0,
 		compactions: 0,
+		compactionAttempts: 0,
+		unknownAuxiliaryUsage: 0,
+		missingCompactionUsage: 0,
+		missingTreeUsage: 0,
+		cancelledCompactions: 0,
+		validUsageReports: 0,
+		zeroUsageReports: 0,
+		missingUsageReports: 0,
+		streamTextBytes: 0,
+		streamReasoningBytes: 0,
+		lastStreamStatusAt: 0,
 		mainUsage: emptyUsage(),
 		auxiliaryUsage: emptyUsage(),
 		nestedUsage: emptyUsage(),
 		estimatedToolTokens: 0,
+		estimatedUserBashTokens: 0,
+		largeContributors: 0,
+		peakPromptTokens: 0,
 		samples: [],
 		anomalies: [],
 		seenAnomalies: new Set(),
 	};
 }
 
-/** 读取模型和 thinking 组合，防止跨配置比较制造上下文或推理误报。 */
-function comparisonKey(ctx: ExtensionContext): { modelKey: string; thinkingLevel: string } {
+/** 优先读取响应实际模型和 provider thinking，只有供应商未返回时才回退当前会话配置。 */
+function comparisonKey(ctx: ExtensionContext, metadata: AssistantMetadata): { modelKey: string; thinkingLevel: string } {
 	const model = ctx.model as { provider?: string; id?: string } | undefined;
+	const provider = metadata.provider ?? model?.provider ?? "unknown";
+	const responseModel = metadata.responseModel ?? metadata.model ?? model?.id ?? "unknown";
 	return {
-		modelKey: model ? `${model.provider ?? "unknown"}/${model.id ?? "unknown"}` : "unknown",
-		thinkingLevel: String(ctx.thinkingLevel ?? "unknown"),
+		modelKey: `${provider}/${responseModel}`,
+		thinkingLevel: metadata.providerThinkingLevel ?? String(ctx.thinkingLevel ?? "unknown"),
 	};
 }
 
 /** 生成一行精确用量摘要；提示词拆分可直接定位缓存异常。 */
 function usageReport(label: string, usage: MeterUsage): string {
 	if (usage.reports === 0) return `${label}：无供应商用量数据`;
-	return `${label}：提示 ${formatTokens(promptTokens(usage))}（输入 ${formatTokens(usage.input)} / 缓存读 ${formatTokens(usage.cacheRead)} / 写 ${formatTokens(usage.cacheWrite)}）· 输出 ${formatTokens(usage.output)} · 推理 ${formatTokens(usage.reasoning)} · 总计 ${formatTokens(usage.totalTokens)} · 费用约 ${formatCost(usage.cost)}`;
+	const reasoning =
+		usage.reasoningReports === 0
+			? "未上报"
+			: `${formatTokens(usage.reasoning)}${usage.reasoningReports < usage.reports ? `（${usage.reasoningReports}/${usage.reports} 次上报）` : ""}`;
+	return `${label}：提示 ${formatTokens(promptTokens(usage))}（输入 ${formatTokens(usage.input)} / 缓存读 ${formatTokens(usage.cacheRead)} / 写 ${formatTokens(usage.cacheWrite)}）· 输出 ${formatTokens(usage.output)} · 推理 ${reasoning} · 总计 ${formatTokens(usage.totalTokens)} · 费用约 ${formatCost(usage.cost)}`;
 }
 
 /** 注册只观察事件、状态栏和用户命令；该扩展不暴露模型工具，也不改写任何上下文。 */
@@ -347,9 +527,23 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 	const sharedState = getSharedState();
 	let sessionMainUsage = emptyUsage();
 	let sessionAuxiliaryUsage = emptyUsage();
+	let idleAuxiliaryUsage = emptyUsage();
 	let sessionNestedUsage = emptyUsage();
 	let sessionEstimatedToolTokens = 0;
+	let sessionEstimatedUserBashTokens = 0;
+	let sessionCompactionAttempts = 0;
+	let sessionUnknownAuxiliaryUsage = 0;
+	let seenBashBloom = new Uint8Array(BASH_BLOOM_BYTES);
+	let seenBashMessageObjects = new WeakSet<object>();
+	let bashScanCursor = 0;
+	let sessionMissingCompactionUsage = 0;
+	let sessionMissingTreeUsage = 0;
+	let sessionCancelledCompactions = 0;
+	let idleUnknownAuxiliaryUsage = 0;
+	let pendingTreeSummary = false;
+	let pendingTreeOperation: OperationState | undefined;
 	let recentAnomalies: Anomaly[] = [];
+	let idleAnomalies: Anomaly[] = [];
 
 	/** 保证运行中的观察事件都归属同一任务窗口。 */
 	function ensureOperation(): OperationState {
@@ -365,9 +559,23 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		boundary = 0;
 		sessionMainUsage = emptyUsage();
 		sessionAuxiliaryUsage = emptyUsage();
+		idleAuxiliaryUsage = emptyUsage();
 		sessionNestedUsage = emptyUsage();
 		sessionEstimatedToolTokens = 0;
+		sessionEstimatedUserBashTokens = 0;
+		sessionCompactionAttempts = 0;
+		sessionUnknownAuxiliaryUsage = 0;
+		seenBashBloom = new Uint8Array(BASH_BLOOM_BYTES);
+		seenBashMessageObjects = new WeakSet();
+		bashScanCursor = 0;
+		sessionMissingCompactionUsage = 0;
+		sessionMissingTreeUsage = 0;
+		sessionCancelledCompactions = 0;
+		idleUnknownAuxiliaryUsage = 0;
+		pendingTreeSummary = false;
+		pendingTreeOperation = undefined;
 		recentAnomalies = [];
+		idleAnomalies = [];
 	}
 
 	/** 在模型或上下文结构发生合理变化后重置相对比较基线。 */
@@ -375,6 +583,27 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		boundary++;
 		previousSample = undefined;
 		if (currentOperation) currentOperation.highReasoningStreak = 0;
+	}
+
+	/** 将没有成功完成事件的待决树摘要记为未知用量，并归属发起时的任务或空闲阶段。 */
+	function settlePendingTreeAsUnknown(): void {
+		if (!pendingTreeSummary) return;
+		if (pendingTreeOperation) {
+			pendingTreeOperation.unknownAuxiliaryUsage++;
+			pendingTreeOperation.missingTreeUsage++;
+		} else {
+			idleUnknownAuxiliaryUsage++;
+		}
+		sessionUnknownAuxiliaryUsage++;
+		sessionMissingTreeUsage++;
+		pendingTreeSummary = false;
+		pendingTreeOperation = undefined;
+	}
+
+	/** 清除已由成功树导航事件结算的待决标记，不增加未知计数。 */
+	function clearPendingTree(): void {
+		pendingTreeSummary = false;
+		pendingTreeOperation = undefined;
 	}
 
 	/** 添加去重后的异常并只通过本地 UI 告警，不写入会话消息。 */
@@ -387,59 +616,176 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		const anomaly = { code, title, detail: truncateDetail(detail), severity, timestamp: Date.now() };
 		operation?.seenAnomalies.add(code);
 		operation?.anomalies.push(anomaly);
+		if (!operation) {
+			idleAnomalies.push(anomaly);
+			if (idleAnomalies.length > MAX_ANOMALIES) idleAnomalies = idleAnomalies.slice(-MAX_ANOMALIES);
+		}
 		recentAnomalies.push(anomaly);
 		if (recentAnomalies.length > MAX_ANOMALIES) recentAnomalies = recentAnomalies.slice(-MAX_ANOMALIES);
 		if (sharedState.alertsEnabled && ctx.hasUI) ctx.ui.notify(`Token 异常：${title}\n${anomaly.detail}`, severity);
 		renderStatus(ctx);
 	}
 
+	/** 汇总任务内已上报的主模型、压缩和工具内模型 Token，不包含会重复进入提示词的工具文本估算。 */
+	function operationReportedTokens(operation: OperationState): number {
+		return operation.mainUsage.totalTokens + operation.auxiliaryUsage.totalTokens + operation.nestedUsage.totalTokens;
+	}
+
+	/** 根据当前模型窗口计算贡献项占比；模型未知时只使用绝对阈值。 */
+	function contributorShare(ctx: ExtensionContext, estimatedTokens: number): number {
+		const model = ctx.model as { contextWindow?: number } | undefined;
+		return model?.contextWindow && model.contextWindow > 0 ? estimatedTokens / model.contextWindow : 0;
+	}
+
+	/** 在每次新增精确用量后实时检查相互独立的任务预算，避免等到 settled 才发现失控。 */
+	function evaluateOperationBudgets(ctx: ExtensionContext): void {
+		const operation = currentOperation;
+		if (!operation) return;
+		if (operation.assistantRequests >= REQUEST_STORM_COUNT) {
+			addAnomaly(
+				ctx,
+				"request-count",
+				"单次任务请求轮次偏多",
+				`已观察到 ${operation.assistantRequests} 次 assistant 请求`,
+				"warning",
+			);
+		}
+		const cumulativePrompt = promptTokens(operation.mainUsage);
+		if (cumulativePrompt >= REQUEST_STORM_PROMPT_TOKENS) {
+			addAnomaly(
+				ctx,
+				"cumulative-prompt",
+				"任务累计提示 Token 异常偏高",
+				`已累计处理 ${formatTokens(cumulativePrompt)} 提示 Token`,
+				"warning",
+			);
+		}
+		const reportedTotal = operationReportedTokens(operation);
+		if (reportedTotal >= OPERATION_TOTAL_TOKENS) {
+			addAnomaly(
+				ctx,
+				"cumulative-total",
+				"任务全口径 Token 异常偏高",
+				`主模型、压缩和工具内模型共上报 ${formatTokens(reportedTotal)} Token`,
+				"warning",
+			);
+		}
+		if (operation.nestedUsage.totalTokens >= NESTED_TOTAL_TOKENS) {
+			addAnomaly(
+				ctx,
+				"cumulative-nested-usage",
+				"工具内模型累计消耗异常偏高",
+				`工具内模型已累计上报 ${formatTokens(operation.nestedUsage.totalTokens)} Token`,
+				"warning",
+			);
+		}
+	}
+
+	/** 空闲压缩和树摘要不归入上次任务，但单次上报超大时仍需立即告警。 */
+	function evaluateIdleAuxiliaryUsage(ctx: ExtensionContext, usage: MeterUsage, source: string): void {
+		if (currentOperation || usage.totalTokens < OPERATION_TOTAL_TOKENS) return;
+		addAnomaly(
+			ctx,
+			"idle-auxiliary-total",
+			"空闲辅助模型调用异常偏高",
+			`${source} 单次上报 ${formatTokens(usage.totalTokens)} Token，未归入上次任务`,
+			"warning",
+		);
+	}
+
 	/** 根据运行态、异常数和会话总量更新独立状态项，不覆盖其他页脚扩展。 */
 	function renderStatus(ctx: ExtensionContext): void {
 		if (!ctx.hasUI) return;
 		const activeOperation = currentOperation;
-		const operation = activeOperation ?? lastOperation;
-		const anomalyCount = activeOperation ? activeOperation.anomalies.length : recentAnomalies.length;
-		if (anomalyCount > 0) {
-			const total = activeOperation
-				? activeOperation.mainUsage.totalTokens + activeOperation.auxiliaryUsage.totalTokens + activeOperation.nestedUsage.totalTokens
-				: sessionMainUsage.totalTokens + sessionAuxiliaryUsage.totalTokens + sessionNestedUsage.totalTokens;
-			ctx.ui.setStatus(STATUS_ID, `Token ⚠ ${anomalyCount} 项 · ${formatTokens(total)}`);
-			return;
-		}
-		if (currentOperation) {
-			const latest = currentOperation.samples.at(-1);
+		if (activeOperation) {
+			const latest = activeOperation.samples.at(-1);
+			const warning = activeOperation.anomalies.length > 0 ? ` ⚠${activeOperation.anomalies.length}` : "";
 			const cache = latest && latest.promptTokens > 0 ? ` · 缓存 ${Math.round(cacheReadRate(latest) * 100)}%` : "";
+			const recent = latest ? ` · 最近 ${formatTokens(latest.promptTokens)}` : "";
+			const liveOutput = Math.ceil((activeOperation.streamTextBytes + activeOperation.streamReasoningBytes) / 4);
+			const streaming = liveOutput > 0 ? ` · 输出~${formatTokens(liveOutput)}` : "";
+			const lowerBound =
+				activeOperation.zeroUsageReports +
+					activeOperation.missingUsageReports +
+					activeOperation.unknownAuxiliaryUsage +
+					(pendingTreeSummary && pendingTreeOperation === activeOperation ? 1 : 0) >
+				0
+					? " · 下界"
+					: "";
 			ctx.ui.setStatus(
 				STATUS_ID,
-				`Token 请求 ${currentOperation.assistantRequests} · 提示 ${formatTokens(currentOperation.mainUsage.input + currentOperation.mainUsage.cacheRead + currentOperation.mainUsage.cacheWrite)}${cache}`,
+				`Token${warning} · 本次 ${formatTokens(operationReportedTokens(activeOperation))} · 请求 ${Math.max(activeOperation.providerRequests, activeOperation.assistantRequests)}${recent}${cache}${streaming}${lowerBound}`,
 			);
 			return;
 		}
-		const total = sessionMainUsage.totalTokens + sessionAuxiliaryUsage.totalTokens + sessionNestedUsage.totalTokens;
-		ctx.ui.setStatus(STATUS_ID, total > 0 ? `Token 正常 · 会话 ${formatTokens(total)}` : "Token 待命");
+		if (idleAnomalies.length > 0 || idleUnknownAuxiliaryUsage > 0 || (pendingTreeSummary && !pendingTreeOperation)) {
+			const warning = idleAnomalies.length > 0 ? ` ⚠${idleAnomalies.length}` : "";
+			ctx.ui.setStatus(
+				STATUS_ID,
+				`Token 空闲辅助${warning} · ${formatTokens(idleAuxiliaryUsage.totalTokens)}${idleUnknownAuxiliaryUsage > 0 || pendingTreeSummary ? " · 下界" : ""}`,
+			);
+			return;
+		}
+		if (lastOperation) {
+			const warning = lastOperation.anomalies.length > 0 ? ` ⚠${lastOperation.anomalies.length}` : " 正常";
+			const lowerBound =
+				lastOperation.zeroUsageReports +
+					lastOperation.missingUsageReports +
+					lastOperation.unknownAuxiliaryUsage >
+				0
+					? " · 下界"
+					: "";
+			ctx.ui.setStatus(STATUS_ID, `Token${warning} · 上次 ${formatTokens(operationReportedTokens(lastOperation))}${lowerBound}`);
+			return;
+		}
+		const sessionTotal = sessionMainUsage.totalTokens + sessionAuxiliaryUsage.totalTokens + sessionNestedUsage.totalTokens;
+		const idleWarning = recentAnomalies.length > 0 ? ` ⚠${recentAnomalies.length}` : " 待命";
+		ctx.ui.setStatus(
+			STATUS_ID,
+			`Token${idleWarning}${sessionTotal > 0 ? ` · 会话 ${formatTokens(sessionTotal)}` : ""}${idleUnknownAuxiliaryUsage > 0 ? " · 下界" : ""}`,
+		);
 	}
 
 	/** 将一次精确主模型用量转为样本，并运行只依赖数字的保守异常规则。 */
-	function recordMainUsage(ctx: ExtensionContext, usage: MeterUsage, stopReason?: string): void {
+	function recordMainUsage(ctx: ExtensionContext, usage: MeterUsage, metadata: AssistantMetadata): void {
 		const operation = ensureOperation();
 		addUsage(operation.mainUsage, usage);
 		addUsage(sessionMainUsage, usage);
-		const keys = comparisonKey(ctx);
+		operation.validUsageReports++;
+		const keys = comparisonKey(ctx, metadata);
 		const context = ctx.getContextUsage();
 		const sample: UsageSample = {
 			...usage,
 			timestamp: Date.now(),
 			promptTokens: promptTokens(usage),
-			stopReason,
+			stopReason: metadata.stopReason,
 			modelKey: keys.modelKey,
 			thinkingLevel: keys.thinkingLevel,
 			boundary,
 			contextPercent: typeof context?.percent === "number" ? context.percent : undefined,
+			requestIndex: operation.assistantRequests,
 		};
 		operation.samples.push(sample);
 		if (operation.samples.length > MAX_SAMPLES) operation.samples = operation.samples.slice(-MAX_SAMPLES);
+		operation.peakPromptTokens = Math.max(operation.peakPromptTokens, sample.promptTokens);
 
+		const contextWindow = context?.contextWindow ?? (ctx.model as { contextWindow?: number } | undefined)?.contextWindow;
+		const contextShare = contextWindow && contextWindow > 0 ? sample.promptTokens / contextWindow : 0;
+		if (sample.promptTokens >= SINGLE_PROMPT_TOKENS || contextShare >= SINGLE_PROMPT_CONTEXT_SHARE) {
+			const critical = contextShare >= 0.7;
+			addAnomaly(
+				ctx,
+				critical ? "single-prompt-critical" : "single-prompt-large",
+				critical ? "单次提示已占用大部分上下文" : "单次提示 Token 异常偏高",
+				`${formatTokens(sample.promptTokens)} Token${contextWindow ? `，约占 ${Math.round(contextShare * 100)}% 上下文` : ""}`,
+				critical ? "error" : "warning",
+			);
+		}
+
+		const canCompare =
+			sample.promptTokens > 0 && metadata.stopReason !== "error" && metadata.stopReason !== "aborted";
 		const comparable =
+			canCompare &&
 			previousSample &&
 			previousSample.boundary === sample.boundary &&
 			previousSample.modelKey === sample.modelKey &&
@@ -482,20 +828,27 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 			}
 		}
 
-		if (stopReason === "length" || sample.output >= OUTPUT_RUNAWAY_TOKENS * 2) {
+		if (metadata.stopReason === "length" || sample.output >= OUTPUT_RUNAWAY_TOKENS * 2) {
 			addAnomaly(
 				ctx,
 				"output-runaway",
-				stopReason === "length" ? "输出达到模型长度限制" : "单次输出异常偏大",
-				`本次输出 ${formatTokens(sample.output)} Token${stopReason === "length" ? "，stopReason=length" : ""}`,
+				metadata.stopReason === "length" ? "输出达到模型长度限制" : "单次输出异常偏大",
+				`本次输出 ${formatTokens(sample.output)} Token${metadata.stopReason === "length" ? "，stopReason=length" : ""}`,
 				"warning",
 			);
 		}
 
 		const reasoningHeavy = sample.reasoning >= REASONING_RUNAWAY_TOKENS && sample.output > 0 && sample.reasoning / sample.output >= 0.8;
-		operation.highReasoningStreak = reasoningHeavy ? operation.highReasoningStreak + 1 : 0;
+		if (!canCompare || sample.reasoningReports === 0) operation.highReasoningStreak = 0;
+		else if (!comparable) operation.highReasoningStreak = reasoningHeavy ? 1 : 0;
+		else operation.highReasoningStreak = reasoningHeavy ? operation.highReasoningStreak + 1 : 0;
 		const thinkingExpected = ["high", "xhigh", "max"].includes(sample.thinkingLevel);
-		if (!thinkingExpected && (sample.reasoning >= REASONING_RUNAWAY_TOKENS * 2 || operation.highReasoningStreak >= 2)) {
+		if (
+			canCompare &&
+			sample.reasoningReports > 0 &&
+			!thinkingExpected &&
+			(sample.reasoning >= REASONING_RUNAWAY_TOKENS * 2 || operation.highReasoningStreak >= 2)
+		) {
 			addAnomaly(
 				ctx,
 				"reasoning-runaway",
@@ -505,17 +858,51 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 			);
 		}
 
-		if (sample.contextPercent !== undefined && sample.contextPercent >= 85) {
+		if (canCompare) previousSample = sample;
+		evaluateOperationBudgets(ctx);
+	}
+
+	/** 记录进入会话的大文本贡献项；8k 仅记账，达到 20k 或窗口 10% 才作为异常提醒。 */
+	function recordEstimatedContributor(
+		ctx: ExtensionContext,
+		name: string,
+		estimatedTokens: number,
+		images: number,
+		anomalyCode: string,
+	): void {
+		const operation = ensureOperation();
+		if (!operation.largestContributor || estimatedTokens > operation.largestContributor.estimatedTokens) {
+			operation.largestContributor = { name, estimatedTokens, images };
+		}
+		if (estimatedTokens >= LARGE_CONTRIBUTOR_TOKENS) operation.largeContributors++;
+		const share = contributorShare(ctx, estimatedTokens);
+		if (estimatedTokens >= LARGE_CONTRIBUTOR_ALERT_TOKENS || share >= 0.1) {
+			addAnomaly(
+				ctx,
+				anomalyCode,
+				"单个上下文贡献项异常偏大",
+				`${name} 约 ${formatTokens(estimatedTokens)} Token${share > 0 ? `，约占模型窗口 ${Math.round(share * 100)}%` : ""}${images ? `，另有 ${images} 张图片未估算` : ""}`,
+				"warning",
+			);
+		}
+	}
+
+	/** 在 turn_end 后读取较稳定的上下文占比，并把接近窗口上限作为独立高风险异常。 */
+	function recordContextRisk(ctx: ExtensionContext): void {
+		const context = ctx.getContextUsage();
+		const operation = currentOperation;
+		if (!operation || typeof context?.percent !== "number") return;
+		const latest = operation.samples.at(-1);
+		if (latest) latest.contextPercent = context.percent;
+		if (context.percent >= CONTEXT_NEAR_LIMIT_PERCENT) {
 			addAnomaly(
 				ctx,
 				"context-near-limit",
 				"上下文接近容量上限",
-				`当前上下文约占 ${sample.contextPercent.toFixed(1)}%`,
-				"warning",
+				`当前上下文约占 ${context.percent.toFixed(1)}%`,
+				"error",
 			);
 		}
-
-		previousSample = sample;
 	}
 
 	/** 统计已经定稿并真正写入会话的工具结果，避免后续扩展替换内容导致误差。 */
@@ -528,34 +915,62 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		const estimate = estimateToolContent(message.content);
 		operation.estimatedToolTokens += estimate.tokens;
 		sessionEstimatedToolTokens += estimate.tokens;
-		if (!operation.largestTool || estimate.tokens > operation.largestTool.estimatedTokens) {
-			operation.largestTool = { name: toolName, estimatedTokens: estimate.tokens, images: estimate.images };
-		}
-		if (estimate.tokens >= LARGE_TOOL_TOKENS) {
-			addAnomaly(
-				ctx,
-				"large-tool-result",
-				"工具结果异常偏大",
-				`${toolName} 返回约 ${formatTokens(estimate.tokens)} Token${estimate.images ? `，另有 ${estimate.images} 张图片未估算` : ""}`,
-				"warning",
-			);
-		}
+		recordEstimatedContributor(ctx, `工具 ${toolName}`, estimate.tokens, estimate.images, "large-tool-result");
 
 		const nestedUsage = normalizeUsage(message.usage);
 		if (nestedUsage) {
 			addUsage(operation.nestedUsage, nestedUsage);
 			addUsage(sessionNestedUsage, nestedUsage);
-			if (nestedUsage.totalTokens >= 100_000) {
-				addAnomaly(
-					ctx,
-					"large-nested-usage",
-					"工具内模型消耗异常偏高",
-					`${toolName} 上报 ${formatTokens(nestedUsage.totalTokens)} Token；该值与主模型分开统计`,
-					"warning",
-				);
-			}
 		}
+		evaluateOperationBudgets(ctx);
 		renderStatus(ctx);
+	}
+
+	/** 用固定 8KB Bloom filter 近似去重克隆后的 bash 消息，宁可极低概率漏计也不让内存增长。 */
+	function hasSeenBashIdentity(hash: string): boolean {
+		const bitCount = seenBashBloom.byteLength * 8;
+		const positions = [0, 8, 16].map((offset) => Number.parseInt(hash.slice(offset, offset + 8), 16) % bitCount);
+		const seen = positions.every((position) => (seenBashBloom[Math.floor(position / 8)] & (1 << (position % 8))) !== 0);
+		for (const position of positions) seenBashBloom[Math.floor(position / 8)] |= 1 << (position % 8);
+		return seen;
+	}
+
+	/** 在下一次 context 事件中延迟发现 user bash 输出，并逐批处理积压、近似去重克隆消息。 */
+	function recordUserBashOutputs(ctx: ExtensionContext, messages: unknown[]): void {
+		if (messages.length === 0) return;
+		const start = bashScanCursor % messages.length;
+		let inspected = 0;
+		let fingerprinted = 0;
+		let added = 0;
+		while (
+			inspected < messages.length &&
+			inspected < MAX_CONTEXT_MESSAGES_SCANNED &&
+			fingerprinted < MAX_BASH_FINGERPRINTS_PER_CONTEXT &&
+			added < MAX_NEW_BASH_PER_CONTEXT
+		) {
+			const index = (start + inspected) % messages.length;
+			inspected++;
+			const message = messages[index];
+			if (!isRecord(message) || message.role !== "bashExecution" || message.excludeFromContext === true) continue;
+			if (typeof message.timestamp !== "number" || typeof message.output !== "string") continue;
+			if (seenBashMessageObjects.has(message)) continue;
+			fingerprinted++;
+			const identity = fingerprintBashExecution(message);
+			if (hasSeenBashIdentity(identity)) {
+				seenBashMessageObjects.add(message);
+				continue;
+			}
+			seenBashMessageObjects.add(message);
+			added++;
+
+			const estimatedTokens = Math.ceil(Buffer.byteLength(message.output, "utf8") / 4);
+			const operation = ensureOperation();
+			operation.estimatedUserBashTokens += estimatedTokens;
+			sessionEstimatedUserBashTokens += estimatedTokens;
+			recordEstimatedContributor(ctx, "user bash", estimatedTokens, 0, "large-user-bash");
+		}
+		bashScanCursor = (start + Math.max(inspected, 1)) % messages.length;
+		if (added > 0) renderStatus(ctx);
 	}
 
 	/** 生成不会进入模型上下文的会话报告，明确区分精确值与估算值。 */
@@ -566,28 +981,65 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 			lines.push("当前会话尚未观察到主模型请求。");
 		} else {
 			const elapsed = Math.max(0, (operation.endedAt ?? Date.now()) - operation.startedAt);
+			const coverage = operation.assistantRequests > 0 ? (operation.validUsageReports / operation.assistantRequests) * 100 : 0;
 			lines.push(
 				`状态：${operation.anomalies.length > 0 ? `${operation.anomalies.length} 项异常` : currentOperation ? "监测中" : "正常"}`,
 				`窗口：${(elapsed / 1000).toFixed(1)} 秒 · assistant ${operation.assistantRequests} 次 · provider hook ${operation.providerRequests} 次 · 可见 HTTP 响应 ${operation.providerResponses} 次`,
+				`usage 完整度：${coverage.toFixed(0)}%（有效 ${operation.validUsageReports} / 全零 ${operation.zeroUsageReports} / 缺失 ${operation.missingUsageReports}）${coverage < 100 ? "，总量仅为下界" : ""}`,
 				usageReport("本次主模型（供应商上报）", operation.mainUsage),
+				`请求峰值：提示 ${formatTokens(operation.peakPromptTokens)} Token`,
 			);
+			if (operation.providerRequests !== operation.assistantRequests) {
+				lines.push(
+					`事件差异：provider hook ${operation.providerRequests} / assistant ${operation.assistantRequests}，网络重试或事件缺失可能使统计不完整`,
+				);
+			}
 			if (operation.auxiliaryUsage.reports > 0) lines.push(usageReport("本次压缩/树摘要（供应商上报）", operation.auxiliaryUsage));
 			if (operation.nestedUsage.reports > 0) lines.push(usageReport("本次工具内模型（工具上报，单独计）", operation.nestedUsage));
-			lines.push(`本次工具结果：约 ${formatTokens(operation.estimatedToolTokens)} Token（本地估算）`);
-			if (operation.largestTool) {
+			if (
+				operation.compactionAttempts > 0 ||
+				operation.unknownAuxiliaryUsage > 0 ||
+				(pendingTreeSummary && pendingTreeOperation === operation)
+			) {
 				lines.push(
-					`最大工具结果：${operation.largestTool.name} 约 ${formatTokens(operation.largestTool.estimatedTokens)} Token${operation.largestTool.images ? `，另有 ${operation.largestTool.images} 张图片未估算` : ""}`,
+					`辅助调用：压缩尝试 ${operation.compactionAttempts} 次 · 成功 ${operation.compactions} 次 · 压缩缺失 ${operation.missingCompactionUsage} · 树摘要缺失 ${operation.missingTreeUsage} · 树摘要待决 ${pendingTreeSummary && pendingTreeOperation === operation ? 1 : 0} · 取消不确定 ${operation.cancelledCompactions}`,
 				);
+			}
+			lines.push(
+				`上下文贡献：工具结果约 ${formatTokens(operation.estimatedToolTokens)} · user bash 约 ${formatTokens(operation.estimatedUserBashTokens)} Token（本地估算）· 大贡献项 ${operation.largeContributors} 个`,
+			);
+			if (operation.largestContributor) {
+				lines.push(
+					`最大贡献项：${operation.largestContributor.name} 约 ${formatTokens(operation.largestContributor.estimatedTokens)} Token${operation.largestContributor.images ? `，另有 ${operation.largestContributor.images} 张图片未估算` : ""}`,
+				);
+			}
+			if (operation.samples.length > 0) {
+				lines.push(
+					"最近请求：",
+					...operation.samples.slice(-5).map((sample) => {
+						const reasoning = sample.reasoningReports > 0 ? formatTokens(sample.reasoning) : "未上报";
+						return `- #${sample.requestIndex} ${sample.modelKey} · 提示 ${formatTokens(sample.promptTokens)} · 缓存 ${Math.round(cacheReadRate(sample) * 100)}% · 输出 ${formatTokens(sample.output)} · 推理 ${reasoning} · ${sample.stopReason ?? "unknown"}`;
+					}),
+				);
+			}
+			if (operation.anomalies.length > 0) {
+				lines.push("本次异常：", ...operation.anomalies.slice(-5).map((item) => `- ${item.title}：${item.detail}`));
 			}
 		}
 
 		lines.push(usageReport("会话主模型", sessionMainUsage));
 		if (sessionAuxiliaryUsage.reports > 0) lines.push(usageReport("会话压缩/树摘要", sessionAuxiliaryUsage));
 		if (sessionNestedUsage.reports > 0) lines.push(usageReport("会话工具内模型（单独计）", sessionNestedUsage));
-		lines.push(`会话工具结果：约 ${formatTokens(sessionEstimatedToolTokens)} Token（本地估算）`);
-		if (recentAnomalies.length > 0) {
-			lines.push("最近异常：", ...recentAnomalies.slice(-5).map((item) => `- ${item.title}：${item.detail}`));
-		} else {
+		lines.push(
+			`会话贡献估算：工具结果约 ${formatTokens(sessionEstimatedToolTokens)} · user bash 约 ${formatTokens(sessionEstimatedUserBashTokens)} Token`,
+			`会话辅助调用：压缩尝试 ${sessionCompactionAttempts} 次 · 压缩缺失 ${sessionMissingCompactionUsage} · 树摘要缺失 ${sessionMissingTreeUsage} · 树摘要待决 ${pendingTreeSummary ? 1 : 0} · 取消不确定 ${sessionCancelledCompactions} · 未知用量合计 ${sessionUnknownAuxiliaryUsage}`,
+		);
+		const historicalAnomalies = operation
+			? recentAnomalies.filter((item) => !operation.anomalies.includes(item))
+			: recentAnomalies;
+		if (historicalAnomalies.length > 0) {
+			lines.push("会话其他历史异常：", ...historicalAnomalies.slice(-5).map((item) => `- ${item.title}：${item.detail}`));
+		} else if (!operation?.anomalies.length) {
 			lines.push("异常：未发现达到保守阈值的行为");
 		}
 		lines.push(
@@ -605,6 +1057,12 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 
 	// 多次 agent_start（重试、续跑）继续归入同一个 agent_settled 窗口。
 	pi.on("agent_start", async (_event, ctx) => {
+		if (!currentOperation) {
+			settlePendingTreeAsUnknown();
+			idleAnomalies = [];
+			idleUnknownAuxiliaryUsage = 0;
+			idleAuxiliaryUsage = emptyUsage();
+		}
 		ensureOperation();
 		renderStatus(ctx);
 	});
@@ -615,21 +1073,23 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		const operation = currentOperation;
 		operation.providerRequests++;
 		const fingerprint = fingerprintPayload(event.payload);
-		if (fingerprint && fingerprint === operation.lastPayloadFingerprint) {
+		if (fingerprint?.comparable && fingerprint.hash === operation.lastPayloadFingerprint) {
 			operation.repeatedPayloads++;
 			if (operation.repeatedPayloads >= 2) {
+				const sampled = fingerprint.sampled || operation.lastPayloadSampled;
 				addAnomaly(
 					ctx,
 					"duplicate-payload",
-					"连续重复发送相同请求",
-					`已连续观察到 ${operation.repeatedPayloads + 1} 次完全相同的 provider payload`,
+					sampled ? "连续重复发送疑似相同的大请求" : "连续重复发送相同请求",
+					`已连续观察到 ${operation.repeatedPayloads + 1} 次${sampled ? "采样指纹" : "完整指纹"}相同的 provider payload`,
 					"warning",
 				);
 			}
 		} else {
 			operation.repeatedPayloads = 0;
 		}
-		operation.lastPayloadFingerprint = fingerprint;
+		operation.lastPayloadFingerprint = fingerprint?.comparable ? fingerprint.hash : undefined;
+		operation.lastPayloadSampled = fingerprint?.comparable ? fingerprint.sampled : false;
 		renderStatus(ctx);
 	});
 
@@ -639,16 +1099,49 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		currentOperation.providerResponses++;
 		if (event.status === 429 || event.status >= 500) {
 			currentOperation.observedHttpFailures++;
-			if (currentOperation.observedHttpFailures >= 2) {
+			currentOperation.consecutiveHttpFailures++;
+			if (currentOperation.consecutiveHttpFailures >= 2) {
 				addAnomaly(
 					ctx,
 					"http-retry-storm",
 					"疑似网络重试风暴",
-					`已观察到 ${currentOperation.observedHttpFailures} 个 429/5xx 响应；实际网络重试可能更多`,
+					`已连续观察到 ${currentOperation.consecutiveHttpFailures} 个 429/5xx 响应；实际网络重试可能更多`,
 					"warning",
 				);
 			}
+		} else {
+			currentOperation.consecutiveHttpFailures = 0;
 		}
+	});
+
+	// assistant 流开始时清空本次本地估算，避免与上一轮或最终供应商 usage 重复显示。
+	pi.on("message_start", (event) => {
+		const message = event.message as { role?: string };
+		if (message.role !== "assistant") return;
+		const operation = ensureOperation();
+		operation.streamTextBytes = 0;
+		operation.streamReasoningBytes = 0;
+		operation.lastStreamStatusAt = 0;
+	});
+
+	// 只累加流式 delta，并限制状态栏刷新频率；partial 和 end 块包含累计内容，不能再次计数。
+	pi.on("message_update", (event, ctx) => {
+		const update = event.assistantMessageEvent as { type?: string; delta?: string };
+		if ((update.type !== "text_delta" && update.type !== "thinking_delta") || typeof update.delta !== "string") return;
+		const operation = ensureOperation();
+		const bytes = Buffer.byteLength(update.delta, "utf8");
+		if (update.type === "thinking_delta") operation.streamReasoningBytes += bytes;
+		else operation.streamTextBytes += bytes;
+		const now = Date.now();
+		if (now - operation.lastStreamStatusAt >= STREAM_STATUS_INTERVAL_MS) {
+			operation.lastStreamStatusAt = now;
+			renderStatus(ctx);
+		}
+	});
+
+	// user bash 没有执行后事件，只在它真正进入下一次模型 context 时延迟统计并去重。
+	pi.on("context", (event, ctx) => {
+		recordUserBashOutputs(ctx, event.messages);
 	});
 
 	// 最终 assistant 消息携带本次供应商用量，是主模型精确记账的唯一来源。
@@ -657,12 +1150,40 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 			role?: string;
 			usage?: unknown;
 			stopReason?: string;
+			provider?: string;
+			model?: string;
+			responseModel?: string;
+			providerThinkingLevel?: string;
 		};
 		if (message.role !== "assistant") return;
 		const operation = ensureOperation();
 		operation.assistantRequests++;
+		operation.streamTextBytes = 0;
+		operation.streamReasoningBytes = 0;
 		const usage = normalizeUsage(message.usage);
-		if (usage) recordMainUsage(ctx, usage, message.stopReason);
+		if (!usage) {
+			operation.missingUsageReports++;
+			operation.highReasoningStreak = 0;
+			addAnomaly(
+				ctx,
+				"usage-incomplete",
+				"供应商用量上报不完整",
+				`第 ${operation.assistantRequests} 次 assistant 请求缺少 usage；当前总量只是下界`,
+				"warning",
+			);
+		} else if (!hasMeaningfulUsage(usage)) {
+			operation.zeroUsageReports++;
+			operation.highReasoningStreak = 0;
+			addAnomaly(
+				ctx,
+				"usage-incomplete",
+				"供应商用量上报不完整",
+				`第 ${operation.assistantRequests} 次 assistant 请求 usage 全零；当前总量只是下界`,
+				"warning",
+			);
+		} else {
+			recordMainUsage(ctx, usage, message);
+		}
 
 		if (message.stopReason === "error") {
 			operation.consecutiveAssistantErrors++;
@@ -678,16 +1199,20 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		} else {
 			operation.consecutiveAssistantErrors = 0;
 		}
+		evaluateOperationBudgets(ctx);
 		renderStatus(ctx);
 	});
 
 	// turn_end 位于工具消息定稿和持久化之后，按最终会话版本统计本轮全部工具结果。
 	pi.on("turn_end", (event, ctx) => {
 		for (const message of event.toolResults) recordToolResult(ctx, message);
+		recordContextRisk(ctx);
 	});
 
 	// 压缩前立即切断比较基线，避免压缩后的正常下降或重写触发误报。
 	pi.on("session_before_compact", async () => {
+		sessionCompactionAttempts++;
+		if (currentOperation) currentOperation.compactionAttempts++;
 		resetComparisonBoundary();
 	});
 
@@ -697,19 +1222,44 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		if (operation) operation.compactions++;
 		const compactEvent = event as { compactionEntry?: { usage?: unknown } };
 		const usage = normalizeUsage(compactEvent.compactionEntry?.usage);
-		if (usage) {
+		if (usage && hasMeaningfulUsage(usage)) {
 			if (operation) addUsage(operation.auxiliaryUsage, usage);
+			else addUsage(idleAuxiliaryUsage, usage);
 			addUsage(sessionAuxiliaryUsage, usage);
+			evaluateIdleAuxiliaryUsage(ctx, usage, "上下文压缩");
+		} else {
+			if (operation) {
+				operation.unknownAuxiliaryUsage++;
+				operation.missingCompactionUsage++;
+			} else {
+				idleUnknownAuxiliaryUsage++;
+			}
+			sessionUnknownAuxiliaryUsage++;
+			sessionMissingCompactionUsage++;
 		}
 		if (operation && operation.compactions >= 2) {
 			addAnomaly(ctx, "repeated-compaction", "单次任务重复压缩", `本次任务已执行 ${operation.compactions} 次压缩`, "warning");
 		}
+		evaluateOperationBudgets(ctx);
 		renderStatus(ctx);
 	});
 
 	// 压缩失败可能已经产生未上报消耗，因此明确标记为未知而不是记零。
 	pi.on("session_compact_failed", (event, ctx) => {
-		if (event.aborted) return;
+		if (currentOperation) {
+			currentOperation.unknownAuxiliaryUsage++;
+			if (event.aborted) currentOperation.cancelledCompactions++;
+			else currentOperation.missingCompactionUsage++;
+		} else {
+			idleUnknownAuxiliaryUsage++;
+		}
+		sessionUnknownAuxiliaryUsage++;
+		if (event.aborted) sessionCancelledCompactions++;
+		else sessionMissingCompactionUsage++;
+		if (event.aborted) {
+			renderStatus(ctx);
+			return;
+		}
 		const outcome = event.errorMessage ? `错误=${event.errorMessage}` : "错误未知";
 		addAnomaly(
 			ctx,
@@ -720,15 +1270,42 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 		);
 	});
 
+	// 只有用户要求摘要且确有待摘要条目时才登记；无完成事件的待决调用随后按未知处理。
+	pi.on("session_before_tree", (event, ctx) => {
+		settlePendingTreeAsUnknown();
+		if (event.preparation.userWantsSummary && event.preparation.entriesToSummarize.length > 0) {
+			pendingTreeSummary = true;
+			pendingTreeOperation = currentOperation;
+		}
+		renderStatus(ctx);
+	});
+
 	// 树导航摘要同样是额外模型调用，若事件提供 usage 则单独计入辅助用量。
 	pi.on("session_tree", (event, ctx) => {
 		const treeEvent = event as { summaryEntry?: { usage?: unknown } };
+		const wasPending = pendingTreeSummary;
+		const owner = pendingTreeOperation ?? currentOperation;
 		const usage = normalizeUsage(treeEvent.summaryEntry?.usage);
-		if (usage) {
-			if (currentOperation) addUsage(currentOperation.auxiliaryUsage, usage);
+		if (usage && hasMeaningfulUsage(usage)) {
+			if (owner) addUsage(owner.auxiliaryUsage, usage);
+			else addUsage(idleAuxiliaryUsage, usage);
 			addUsage(sessionAuxiliaryUsage, usage);
+			evaluateIdleAuxiliaryUsage(ctx, usage, "树导航摘要");
+			clearPendingTree();
+		} else if (wasPending) {
+			settlePendingTreeAsUnknown();
+		} else if (treeEvent.summaryEntry) {
+			if (owner) {
+				owner.unknownAuxiliaryUsage++;
+				owner.missingTreeUsage++;
+			} else {
+				idleUnknownAuxiliaryUsage++;
+			}
+			sessionUnknownAuxiliaryUsage++;
+			sessionMissingTreeUsage++;
 		}
 		resetComparisonBoundary();
+		evaluateOperationBudgets(ctx);
 		renderStatus(ctx);
 	});
 
@@ -746,18 +1323,7 @@ export default function requestMeterExtension(pi: ExtensionAPI): void {
 	pi.on("agent_settled", async (_event, ctx) => {
 		const operation = currentOperation;
 		if (!operation) return;
-		if (
-			operation.assistantRequests >= REQUEST_STORM_COUNT &&
-			promptTokens(operation.mainUsage) >= REQUEST_STORM_PROMPT_TOKENS
-		) {
-			addAnomaly(
-				ctx,
-				"request-storm",
-				"单次任务累计请求异常偏多",
-				`${operation.assistantRequests} 次 assistant 请求累计处理 ${formatTokens(promptTokens(operation.mainUsage))} 提示 Token`,
-				"warning",
-			);
-		}
+		evaluateOperationBudgets(ctx);
 		operation.endedAt = Date.now();
 		lastOperation = operation;
 		currentOperation = undefined;
